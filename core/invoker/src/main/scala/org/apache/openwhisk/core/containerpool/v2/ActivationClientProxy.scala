@@ -63,6 +63,12 @@ case class Client(activationClient: ActivationServiceClient, rpcHost: String, rp
     extends ActivationClientProxyData
 case class Retry(count: Int) extends ActivationClientProxyData
 
+/**
+ * ActivationClientProxy is an actor that is responsible for fetching activation messages from the scheduler.
+ * It is created when a container is created and is responsible for fetching activation messages from the scheduler.
+ * It is also responsible for rescheduling activations. It is also responsible for handling errors and shutting down the client when the container is idle.
+ */
+
 class ActivationClientProxy(
   invocationNamespace: String,
   action: FullyQualifiedEntityName,
@@ -279,6 +285,10 @@ class ActivationClientProxy(
     case _ -> ClientProxyRemoving => unstashAll()
   }
 
+  /**
+   * When the container is warmed, the activation client proxy will be in the ClientProxyReady state.
+   * When the container is idle, the activation client proxy will be in the ClientProxyRemoving state.
+   */
   whenUnhandled {
     case Event(ContainerWarmed, _) =>
       warmed = true

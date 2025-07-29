@@ -55,7 +55,7 @@ whisk:
   containerProxy:
     timeouts:
       idleContainer: "{{ containerProxy_timeouts_idleContainer | default('10 minutes') }}"
-      pauseGrace: "{{ containerProxy_timeouts_pauseGrace | default('10 seconds') }}"
+      pauseGrace: "{{ containerProxy_timeouts_pauseGrace | default('30 seconds') }}"
       keepingDuration: "{{ containerProxy_timeouts_keepingDuration | default('10 minutes') }}"
 
 ##

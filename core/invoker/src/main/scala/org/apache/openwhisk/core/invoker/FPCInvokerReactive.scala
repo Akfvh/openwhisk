@@ -209,7 +209,8 @@ class FPCInvokerReactive(config: WhiskConfig,
           instance,
           healthManger,
           poolConfig,
-          containerProxyTimeoutConfig))
+          containerProxyTimeoutConfig,
+          metricCollector))
   }
 
   private val invokerHealthManager =
@@ -312,7 +313,8 @@ class FPCInvokerReactive(config: WhiskConfig,
           instance,
           invokerHealthManager,
           poolConfig,
-          containerProxyTimeoutConfig))
+          containerProxyTimeoutConfig,
+          metricCollector))
   }
 
   /** Creates a ActivationClientProxy Actor when being called. */
@@ -342,6 +344,19 @@ class FPCInvokerReactive(config: WhiskConfig,
     actorSystem.actorOf(
       ContainerPoolV2
         .props(childFactory, invokerHealthManager, poolConfig, instance, prewarmingConfigs, sendAckToScheduler))
+
+  // Initialize ContainerMetricCollectorActor
+  //private val metricCollectorPath = loadConfigOrThrow[String](ConfigKeys.containerMetricsLogPath)
+  private val metricCollectorPath = "/logs/container-metrics.log"
+
+  // support dynamic log path
+  // val invokerName = loadConfigOrThrow[String](ConfigKeys.whiskInvokerUsername)
+  // val baseLogPath = loadConfigOrThrow[String](ConfigKeys.containerMetricsLogPath)
+  //val resolvedPath = baseLogPath.replace("${invokerName}", invokerName)
+  
+
+  private val metricCollector = actorSystem.actorOf(ContainerMetricCollectorActor.props(metricCollectorPath))
+
 
   private def getLiveContainerCount(invocationNamespace: String,
                                     fqn: FullyQualifiedEntityName,

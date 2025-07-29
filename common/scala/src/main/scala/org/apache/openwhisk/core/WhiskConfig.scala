@@ -272,6 +272,9 @@ object ConfigKeys {
   val containerProxyHealth = s"$containerProxy.action-health-check"
   val containerProxyActivationErrorLogs = s"$containerProxy.log-activation-errors"
 
+  val containerMetrics = "whisk.container-metrics"
+  val containerMetricsLogPath = s"$containerMetrics.log"
+
   val s3 = "whisk.s3"
   val query = "whisk.query-limit"
   val execSizeLimit = "whisk.exec-size-limit"

@@ -90,6 +90,15 @@
     dockerInfo: "{{ dockerInfo_output.stdout|from_json }}"
   when: environmentInformation.type != "docker-machine"
 
+- name: logs.dir.become
+  debug:
+    msg: "logs.dir.become = {{ logs.dir.become | default('UNDEFINED') }}"
+
+- name: debug invoker.dir.become
+  debug:
+    msg: "invoker.dir.become = {{ invoker.dir.become | default('UNDEFINED') }}"
+
+
 - name: ensure invoker log directory is created with permissions
   file:
     path: "{{ whisk_logs_dir }}/{{ invoker_name }}"

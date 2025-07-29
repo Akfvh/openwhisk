@@ -207,6 +207,7 @@ class FunctionPullingContainerProxy(
   invokerHealthManager: ActorRef,
   poolConfig: ContainerPoolConfig,
   timeoutConfig: ContainerProxyTimeoutConfig,
+  metricCollector: ActorRef,
   healtCheckConfig: ContainerProxyHealthCheckConfig,
   testTcp: Option[ActorRef])(implicit actorSystem: ActorSystem, logging: Logging)
     extends FSM[ProxyState, Data]
@@ -227,6 +228,7 @@ class FunctionPullingContainerProxy(
   private var timedOut = false
 
   var healthPingActor: Option[ActorRef] = None //setup after prewarm starts
+  var containerLifeCycleReport: ContainerLifeCycleEvent = _
   val tcp: ActorRef = testTcp.getOrElse(IO(Tcp)) //allows to testing interaction with Tcp extension
 
   val runningActivations = new java.util.concurrent.ConcurrentHashMap[String, Boolean]
@@ -249,6 +251,8 @@ class FunctionPullingContainerProxy(
 
     // cold start
     case Event(job: Initialize, _) =>
+      val createContainerStart = Instant.now()
+
       factory( // create a new container
         TransactionId.invokerColdstart,
         containerName(instance, job.action.namespace.namespace, job.action.name.asString),
@@ -263,6 +267,19 @@ class FunctionPullingContainerProxy(
             context.parent ! ContainerCreationFailed(t)
         }
         .map { container =>
+          // initialize container life cycle report
+          containerLifeCycleReport = ContainerLifeCycleEvent(
+            containerId = container.containerId.asString,
+            invokerName = Some(instance.toString),
+            actionName = Some(job.action.name.toString),
+            memReservedMB = Some(job.action.limits.memory.megabytes),
+            created = Some(createContainerStart),
+            startInit = None,
+            endInit = None,
+            startRun = Seq.empty,
+            endRun = Seq.empty,
+            destroyed = None
+          )
           logging.debug(this, s"a container ${container.containerId} is created for ${job.action}")
           // create a client
           Try(
@@ -381,12 +398,15 @@ class FunctionPullingContainerProxy(
     case Event(initializedData: InitializedData, _) =>
       context.parent ! Initialized(initializedData)
       initializedData.clientProxy ! RequestActivation()
+      // start the timer to detect if the container is idle
       startTimerWithFixedDelay(PingCacheName, PingCache, pingCacheInterval)
+      // start the timer to detect if the container is unused
       startSingleTimer(UnusedTimeoutName, StateTimeout, unusedTimeout)
       stay() using initializedData
 
     // 2. read executable action data from db
     case Event(job: ActivationMessage, data: InitializedData) =>
+      // reset the timeout since we are handling an activation
       timedOut = false
       cancelTimer(UnusedTimeoutName)
       handleActivationMessage(job, data.action)
@@ -425,6 +445,15 @@ class FunctionPullingContainerProxy(
     case Event(completed: InitCodeCompleted, data: InitializedData) =>
       // TODO support concurrency?
       data.clientProxy ! ContainerWarmed // this container is warmed
+
+      /**
+       *  container warmed message is sent to the ActivationClientProxy,
+       *  this will cause the ActivationClientProxy to move to the ClientProxyReady state.
+       *  This is the first step to start handling activations.
+       *  ContainerProxy will stay in the ClientCreated state until the ActivationClientProxy is ready to handle activations.
+       */
+
+      // start handling activations
       1 until completed.data.action.limits.concurrency.maxConcurrent foreach { _ =>
         data.clientProxy ! RequestActivation()
       }
@@ -864,6 +893,8 @@ class FunctionPullingContainerProxy(
     dataManagementService ! UnregisterData(
       s"${ContainerKeys.existingContainers(invocationNamespace, fqn, revision, Some(instance), Some(container.containerId))}")
 
+    containerLifeCycleReport = containerLifeCycleReport.copy(destroyed = Some(Instant.now()))
+    metricCollector ! containerLifeCycleReport
     cleanUp(container, clientProxy)
   }
 
@@ -1087,6 +1118,10 @@ class FunctionPullingContainerProxy(
       .flatMap { initInterval =>
         // immediately setup warmedData for use (before first execution) so that concurrent actions can use it asap
         if (initInterval.isDefined) {
+          containerLifeCycleReport = containerLifeCycleReport.copy(
+            startInit = Some(initInterval.get.start), 
+            endInit = Some(initInterval.get.end)
+          )
           stateData match {
             case _: InitializedData =>
               self ! InitCodeCompleted(
@@ -1112,6 +1147,10 @@ class FunctionPullingContainerProxy(
             resumeRun.isDefined)(msg.transid)
           .map {
             case (runInterval, response) =>
+              containerLifeCycleReport = containerLifeCycleReport.copy(
+                startRun = containerLifeCycleReport.startRun :+ runInterval.start,
+                endRun = containerLifeCycleReport.endRun :+ runInterval.end
+              )
               val initRunInterval = initInterval
                 .map(i => Interval(runInterval.start.minusMillis(i.duration.toMillis), runInterval.end))
                 .getOrElse(runInterval)
@@ -1299,6 +1338,7 @@ object FunctionPullingContainerProxy {
             invokerHealthManager: ActorRef,
             poolConfig: ContainerPoolConfig,
             timeoutConfig: ContainerProxyTimeoutConfig,
+            metricCollector: ActorRef,
             healthCheckConfig: ContainerProxyHealthCheckConfig =
               loadConfigOrThrow[ContainerProxyHealthCheckConfig](ConfigKeys.containerProxyHealth),
             tcp: Option[ActorRef] = None)(implicit actorSystem: ActorSystem, logging: Logging) =
@@ -1319,6 +1359,7 @@ object FunctionPullingContainerProxy {
         invokerHealthManager,
         poolConfig,
         timeoutConfig,
+        metricCollector,
         healthCheckConfig,
         tcp))
 
