@@ -35,7 +35,7 @@ apigw_host_v2: "http://{{ groups['apigateway']|first }}:{{apigateway.port.api}}/
 invoker_allow_multiple_instances: true
 
 # Set kafka configuration
-kafka_heap: '512m'
+kafka_heap: '1g'
 kafka_topics_completed_retentionBytes: 104857600
 kafka_topics_completed_retentionMS: 300000
 kafka_topics_health_retentionBytes: 104857600
@@ -49,3 +49,22 @@ container_pool_akka_client: true
 runtimes_enable_concurrency: true
 limit_action_concurrency_max: 500
 namespace_default_limit_action_concurrency_max: 500
+
+# for using ShardingLoadbalancer
+scheduler_enable: false
+
+# invoker memory
+invoker_heap: '20g'
+
+# controller memroy
+controller_memory: '2g'
+
+# container timeout
+containerProxy_timeouts_idleContainer: '10 minutes'
+containerProxy_timeouts_pauseGrace: '30 seconds'
+
+# limits
+limit_invocations_per_minute: 300
+limit_invocations_concurrent: 30
+limit_fires_per_minute: 60
+limit_sequence_max_length: 50
