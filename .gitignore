@@ -1,0 +1,19 @@
+# Gradle
+.gradle/
+**/build/
+
+# Scala/Java
+**/*.class
+*.log
+
+# sbt (있다면)
+target/
+project/target/
+project/boot/
+
+# Coverage (scoverage 등)
+**/scoverage/
+**/scoverage-data/
+**/scoverage-report/
+**/bin/scoverage/
+
