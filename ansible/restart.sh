@@ -6,7 +6,8 @@ rm -rf *
 
 cd ~/Serverless/openwhisk/ansible
 
-export ENVIRONMENT=local
+#export ENVIRONMENT=local
+export ENVIRONMENT=distributed
 
 ansible-playbook -i environments/$ENVIRONMENT couchdb.yml; 
 ansible-playbook -i environments/$ENVIRONMENT initdb.yml; 
@@ -16,5 +17,6 @@ ansible-playbook -i environments/$ENVIRONMENT postdeploy.yml;
 ansible-playbook -i environments/$ENVIRONMENT apigateway.yml; 
 ansible-playbook -i environments/$ENVIRONMENT routemgmt.yml
 
-cd ~/benchmarks/serverless/rainbowCake
-./deploy_functions.sh
+# deploy functions
+cd ~/benchmarks/serverless
+./deploy.sh

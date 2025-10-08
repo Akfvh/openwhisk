@@ -336,7 +336,8 @@ db:
 
 apigateway:
   port:
-    api: 9000
+  # default api port was 9000
+    api: 9003
     mgmt: 9001
   # Default to 'nightly', which tracks the head revision of the master branch of apigateway's gitrepo
   version: nightly
