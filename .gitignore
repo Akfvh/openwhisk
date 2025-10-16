@@ -1,19 +1,67 @@
-# Gradle
-.gradle/
-**/build/
+# --- OS / 편집기 잡동사니 ---
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
 
-# Scala/Java
-**/*.class
+# --- IDE ---
+# IntelliJ / Android Studio
+.idea/
+*.iml
+*.ipr
+*.iws
+# Eclipse
+.project
+.classpath
+.settings/
+# VS Code
+.vscode/
+
+# --- 공통 Java 산출물 ---
+*.class
 *.log
+hs_err_pid*
+replay_pid*
 
-# sbt (있다면)
+# --- 패키징 산출물 (커밋 금지) ---
+*.jar
+*.war
+*.ear
+*.zip
+*.tar.gz
+
+# 필요 시 특정 JAR만 화이트리스트 (예: 빌드 래퍼)
+!gradle/wrapper/gradle-wrapper.jar
+!.mvn/wrapper/maven-wrapper.jar
+
+# --- Gradle ---
+.gradle/
+build/
+# Kotlin/Java annotation processing outputs
+**/out/
+
+# --- Maven ---
+target/
+
+# --- SBT ---
 target/
 project/target/
-project/boot/
+project/project/      # sbt meta-build
+# (Scala 도구들)
+.bloop/
+.metals/
+.scala-build/
+.sbt.lock
+.cache/
 
-# Coverage (scoverage 등)
-**/scoverage/
-**/scoverage-data/
-**/scoverage-report/
-**/bin/scoverage/
+# --- 테스트/커버리지 ---
+coverage/
+.scoverage/
+*.exec
+jacoco*.exec
+
+# --- Docker/기타 임시 ---
+*.pid
+tmp/
 
