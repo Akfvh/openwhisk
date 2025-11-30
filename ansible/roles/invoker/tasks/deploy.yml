@@ -211,6 +211,10 @@
   when: jmx.enabled
   set_fact:
     invoker_ports_to_expose: "{{ invoker_ports_to_expose }} + [ \"{{ jmx.basePortInvoker + (invoker_index | int) }}:{{ jmx.basePortInvoker + (invoker_index | int) }}\" ] + [ \"{{ jmx.rmiBasePortInvoker + (invoker_index | int) }}:{{ jmx.rmiBasePortInvoker + (invoker_index | int) }}\" ]"
+  
+- name: expose probing agent bridge port
+  set_fact:
+    invoker_ports_to_expose: "{{ invoker_ports_to_expose }} + [ '50051:50051' ]"
 
 
 - name: Load config from template

@@ -63,9 +63,9 @@ controller_memory: '2g'
 
 # container timeout
 #containerProxy_timeouts_idleContainer: '10 minutes'
-containerProxy_timeouts_idleContainer: '5 minutes'
+containerProxy_timeouts_idleContainer: '1 minutes'
 #containerProxy_timeouts_pauseGrace: '30 seconds'
-containerProxy_timeouts_pauseGrace: '5 minutes'
+containerProxy_timeouts_pauseGrace: '2 minutes'
 
 # limits
 #limit_invocations_per_minute: 300
