@@ -35,7 +35,7 @@ import scala.util.{Failure, Success}
 object ProbingAgentBridgeProtocol extends DefaultJsonProtocol {
   final case class AgentUpdate(
     containerId: String,
-    newLimitMB: Int
+    newLimitBytes: Long
   )
   implicit val agentUpdateFormat: RootJsonFormat[AgentUpdate] =
     jsonFormat2(AgentUpdate)
@@ -79,7 +79,7 @@ class ProbingAgentBridge(agentAddress: String,
           logging.info(this, s"Received ${updates.size} commit updates")
 
           val poolUpdates = updates.map { u =>
-            ContainerPool.ContainerMemoryDownsized(u.containerId, u.newLimitMB.MB)
+            ContainerPool.ContainerMemoryDownsized(u.containerId, u.newLimitBytes.B)
           }
 
           pool match {

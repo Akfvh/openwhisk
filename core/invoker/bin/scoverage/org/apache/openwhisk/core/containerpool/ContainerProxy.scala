@@ -88,6 +88,7 @@ case object ProbeDisabled extends ProbePhase // permanently disabled
 /** Base data type */
 sealed abstract class ContainerData(val lastUsed: Instant, 
   val memoryLimit: ByteSize, 
+  val downsizedMemory: Option[ByteSize] = None,
   val activeActivationCount: Int
 ) {
 
@@ -105,13 +106,16 @@ sealed abstract class ContainerData(val lastUsed: Instant,
 
   /** Inidicates whether this container can service additional activations */
   def hasCapacity(): Boolean
+
+  /** Updates the memory limit of this container */
+  def withMemoryLimit(newLimit: ByteSize): ContainerData
 }
 
 /** abstract type to indicate an unstarted container */
 sealed abstract class ContainerNotStarted(override val lastUsed: Instant,
                                           override val memoryLimit: ByteSize,
                                           override val activeActivationCount: Int,
-) extends ContainerData(lastUsed, memoryLimit, activeActivationCount) {
+) extends ContainerData(lastUsed, memoryLimit, None, activeActivationCount) {
   override def getContainer = None
   override val initingState = "cold"
 }
@@ -121,7 +125,7 @@ sealed abstract class ContainerStarted(val container: Container,
                                        override val lastUsed: Instant,
                                        override val memoryLimit: ByteSize,
                                        override val activeActivationCount: Int,
-) extends ContainerData(lastUsed, memoryLimit, activeActivationCount) {
+) extends ContainerData(lastUsed, memoryLimit, None, activeActivationCount) {
   override def getContainer = Some(container)
 }
 
@@ -131,6 +135,9 @@ sealed abstract trait ContainerInUse {
   val action: ExecutableWhiskAction
   def hasCapacity() =
     activeActivationCount < action.limits.concurrency.maxConcurrent
+
+  /** Updates the memory limit of this container */
+
 }
 
 /** trait representing a container that is NOT in use and is usable by subsequent activation(s) */
@@ -144,6 +151,7 @@ case class NoData(
 ) extends ContainerNotStarted(Instant.EPOCH, 0.B, activeActivationCount)
     with ContainerNotInUse {
   override def nextRun(r: Run) = WarmingColdData(r.msg.user.namespace.name, r.action, Instant.now, 1)
+  override def withMemoryLimit(newLimit: ByteSize): ContainerData = this
 }
 
 /** type representing a cold (not running) container with specific memory allocation */
@@ -152,6 +160,7 @@ case class MemoryData(override val memoryLimit: ByteSize,
 ) extends ContainerNotStarted(Instant.EPOCH, memoryLimit, activeActivationCount)
     with ContainerNotInUse {
   override def nextRun(r: Run) = WarmingColdData(r.msg.user.namespace.name, r.action, Instant.now, 1)
+  override def withMemoryLimit(newLimit: ByteSize): ContainerData = this
 }
 
 /** type representing a prewarmed (running, but unused) container (with a specific memory allocation) */
@@ -166,6 +175,7 @@ case class PreWarmedData(override val container: Container,
   override def nextRun(r: Run) =
     WarmingData(container, r.msg.user.namespace.name, r.action, Instant.now, 1)
   def isExpired(): Boolean = expires.exists(_.isOverdue())
+  override def withMemoryLimit(newLimit: ByteSize): ContainerData = this
 }
 
 /** type representing a prewarm (running, but not used) container that is being initialized (for a specific action + invocation namespace) */
@@ -179,6 +189,7 @@ case class WarmingData(override val container: Container,
     with ContainerInUse {
   override val initingState = "warming"
   override def nextRun(r: Run) = copy(lastUsed = Instant.now, activeActivationCount = activeActivationCount + 1)
+  override def withMemoryLimit(newLimit: ByteSize): ContainerData = this
 }
 
 /** type representing a cold (not yet running) container that is being initialized (for a specific action + invocation namespace) */
@@ -191,6 +202,7 @@ case class WarmingColdData(invocationNamespace: EntityName,
     with ContainerInUse {
   override val initingState = "warmingCold"
   override def nextRun(r: Run) = copy(lastUsed = Instant.now, activeActivationCount = activeActivationCount + 1)
+  override def withMemoryLimit(newLimit: ByteSize): ContainerData = this
 }
 
 /** type representing a warm container that has already been in use (for a specific action + invocation namespace) */
@@ -199,14 +211,18 @@ case class WarmedData(override val container: Container,
                       action: ExecutableWhiskAction,
                       override val lastUsed: Instant,
                       override val activeActivationCount: Int = 0,
-                      resumeRun: Option[Run] = None)
-    extends ContainerStarted(container, lastUsed, action.limits.memory.megabytes.MB, activeActivationCount)
+                      resumeRun: Option[Run] = None,
+                      override val downsizedMemory: Option[ByteSize] = None) // extra field, to maintain warm tracking
+    extends ContainerStarted(container, lastUsed, downsizedMemory.getOrElse(action.limits.memory.megabytes.MB), activeActivationCount)
     with ContainerInUse {
   override val initingState = "warmed"
   override def nextRun(r: Run) = copy(lastUsed = Instant.now, activeActivationCount = activeActivationCount + 1)
   //track the resuming run for easily referring to the action being resumed (it may fail and be resent)
   def withoutResumeRun() = this.copy(resumeRun = None)
   def withResumeRun(job: Run) = this.copy(resumeRun = Some(job))
+  def withDownsizedMemory(newLimit: ByteSize): ContainerData = this.copy(downsizedMemory = Some(newLimit))
+  override def withMemoryLimit(newLimit: ByteSize): ContainerData = this.withDownsizedMemory(newLimit)
+
 }
 
 // Events received by the actor
@@ -288,6 +304,7 @@ class ContainerProxy(factory: (TransactionId,
     with Stash {
   
   import ProbingAgentBridge._
+  import ContainerProxy.UpdateMemoryLimit
 
   implicit val ec = context.system.dispatcher
   implicit val logging = new AkkaLogging(context.system.log)
@@ -418,6 +435,17 @@ class ContainerProxy(factory: (TransactionId,
   when(Running) {
     // Intermediate state, we were able to start a container
     // and we keep it in case we need to destroy it.
+
+    case Event(UpdateMemoryLimit(newLimit), data: WarmedData) =>
+      logging.info(this, s"[RUNNING] Downsizing container ${data.container.containerId.asString} to ${newLimit.toMB} MB")
+
+      // update container data
+      val newData = data.withMemoryLimit(newLimit)
+
+      // don't notify while running, will be notified when we go to Ready state
+      stay using newData
+
+
     case Event(completed: PreWarmCompleted, _) => stay using completed.data
 
     // Run during prewarm init (for concurrent > 1)
@@ -539,6 +567,16 @@ class ContainerProxy(factory: (TransactionId,
   }
 
   when(Ready, stateTimeout = pauseGrace) {
+    case Event(UpdateMemoryLimit(newLimit), data: WarmedData) =>
+      logging.info(this, s"Downsizing container ${data.container.containerId.asString} to ${newLimit.toMB} MB")
+
+      // update container data
+      val newData = data.withMemoryLimit(newLimit)
+
+      // notify the pool to update the container data (majority case, but not guaranteed)
+      context.parent ! NeedWork(newData)
+      stay using newData
+
     case Event(job: Run, data: WarmedData) =>
       implicit val transid = job.msg.transid
       activeCount += 1
@@ -1067,6 +1105,7 @@ object ContainerProxy {
         tcp,
         probingAgentBridge
       ))
+  case class UpdateMemoryLimit(newLimit: ByteSize)
 
   // Needs to be thread-safe as it's used by multiple proxies concurrently.
   private val containerCount = new Counter

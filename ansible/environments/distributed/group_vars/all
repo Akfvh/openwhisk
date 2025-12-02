@@ -56,7 +56,7 @@ runtimes_enable_concurrency: true
 scheduler_enable: false
 
 # invoker memory
-invoker_user_memory: '20g'
+invoker_user_memory: '1g'
 
 # controller memroy
 controller_memory: '2g'

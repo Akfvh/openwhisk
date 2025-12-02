@@ -166,7 +166,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
               // Remove a container and create a new one for the given job
               ContainerPool
               // Only free up the amount, that is really needed to free up
-                .remove(freePool, Math.min(r.action.limits.memory.megabytes, effectiveMemoryConsumptionOf(freePool)).MB)
+                .remove(freePool, Math.min(r.action.limits.memory.megabytes, memoryConsumptionOf(freePool)).MB)
                 .map(removeContainer)
                 // If the list had at least one entry, enough containers were removed to start the new container. After
                 // removing the containers, we are not interested anymore in the containers that have been removed.
@@ -499,18 +499,38 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
     MetricEmitter.emitGaugeMetric(LoggingMarkers.CONTAINER_POOL_IDLES_SIZE, unusedMB)
   }
 
+  /** Updates the memory limit of the containers in the pool */
+  // 1. Send each containerproxy a message to update the memory limit
+  // 2. Update the container data in the pool
   def updateCommits(commits: List[ContainerMemoryDownsized]): Unit = {
-    // TODO. Handle the case where the container is not in the pool.
     commits.foreach { commit =>
-      downsizedLimits = downsizedLimits + (commit.containerId -> commit.newLimitBytes)
-      logging.info(this, s"downsized container ${commit.containerId} to ${commit.newLimitBytes.toMB} MB")
+      val newLimit = commit.newLimitBytes
+      val containerId = commit.containerId
+      
+      def updatePool(pool: Map[ActorRef, ContainerData]): Map[ActorRef, ContainerData] = {
+        pool.map {
+          case (ref, w: WarmedData) if w.container.containerId.asString == containerId =>
+            // request update to containerproxy
+            ref ! ContainerProxy.UpdateMemoryLimit(newLimit)
+
+            // update pool manually
+            ref -> w.withDownsizedMemory(newLimit)
+          case other => other
+        }
+      }
+
+      freePool = updatePool(freePool)
+      busyPool = updatePool(busyPool)
     }
   }
 
   private def effectiveMemoryConsumptionOf[A](pool: Map[A, ContainerData]): Long = {
+    logging.info(this, s"downsizedLimits: $downsizedLimits")
+    logging.info(this, s"pool: $pool")
     pool.map {
       case (_, w: WarmedData) => 
         val cid = w.container.containerId.asString
+        logging.info(this, s"downsizedLimits.getOrElse(cid, w.memoryLimit): ${downsizedLimits.getOrElse(cid, w.memoryLimit)}")
         downsizedLimits.getOrElse(cid, w.memoryLimit).toMB
       case (_, other) => 
         other.memoryLimit.toMB
@@ -555,7 +575,7 @@ object ContainerPool {
 
     idles
       .find {
-        case (_, c @ WarmedData(_, `invocationNamespace`, `action`, _, _, _)) if c.hasCapacity() => true
+        case (_, c @ WarmedData(_, `invocationNamespace`, `action`, _, _, _, _)) if c.hasCapacity() => true
         case _                                                                                   => false
       }
       .orElse {
