@@ -178,16 +178,24 @@ protected[actions] trait PrimitiveActions {
       case _                      => None
     }
 
-    println(s"
-      action: $action
-      namespace: ${action.namespace}
-      name: ${action.name}
-      version: ${action.version}
-      binding: ${action.binding}
-      rev: ${action.rev}
-      user: $user
-      activationId: $activationId
-    ")
+    // IAT-CV Tracker
+    val (iat, cv) = ResearchTracker.getMetrics(action.fullyQualifiedName(false).toString)
+
+    // Create JSON data
+    val iatParams = JsObject(
+      "iat" -> JsNumber(iat),
+      "cv" -> JsNumber(cv)
+    )
+
+    // Merge with existing payload
+    val newContent = args match {
+      case Some(JsObject(fields)) => Some(JsObject(fields ++ iatParams.fields))
+      case None => Some(iatParams)
+      case other => other
+    }
+
+    logging.info(this, s"Origianl payload: $payload")
+    logging.info(this, s"New payload: $newContent")
 
     val message = ActivationMessage(
       transid,
@@ -197,7 +205,7 @@ protected[actions] trait PrimitiveActions {
       activationId, // activation id created here
       activeAckTopicIndex,
       waitForResponse.isDefined,
-      args,
+      newContent,
       action.parameters.initParameters,
       action.parameters.lockedParameters(keySet.getOrElse(Set.empty)),
       cause = cause,
@@ -718,3 +726,60 @@ protected[actions] trait PrimitiveActions {
 }
 
 case class ControllerActivationConfig(pollingFromDb: Boolean, maxWaitForBlockingActivation: FiniteDuration)
+
+
+/* IAT-CV Tracker 
+ * Hook annotation of whiskActivation to track IAT-CV metrics
+ */
+object ResearchTracker {
+  import java.util.concurrent.ConcurrentHashMap
+  
+  // Internal state class for Welford's algorithm
+  // count: number of invocations
+  // lastTime: timestamp of the previous invocation
+  // mean: running mean of IAT
+  // m2: sum of squares of differences from the current mean (used for variance)
+  case class IATStats(var count: Long = 0, var lastTime: Long = 0, var mean: Double = 0.0, var m2: Double = 0.0)
+
+  private val statsMap = new ConcurrentHashMap[String, IATStats]()
+
+  def getMetrics(actionName: String): (Double, Double) = {
+    val now = System.currentTimeMillis()
+    
+    // We synchronize on the specific map entry to ensure thread safety per action
+    // computeIfAbsent ensures the entry exists
+    val stats = statsMap.computeIfAbsent(actionName, _ => IATStats())
+
+    stats.synchronized {
+      if (stats.count == 0) {
+        // First invocation ever
+        stats.lastTime = now
+        stats.count += 1
+        return (0.0, 0.0) // No IAT/CV for the very first request
+      }
+
+      // 1. Calculate Instantaneous IAT
+      val iat = (now - stats.lastTime).toDouble
+      stats.lastTime = now
+      stats.count += 1
+
+      // 2. Update Running Statistics (Welford's Algorithm)
+      val delta = iat - stats.mean
+      stats.mean += delta / (stats.count - 1) // count-1 because first arrival has no IAT
+      val delta2 = iat - stats.mean
+      stats.m2 += delta * delta2
+
+      // 3. Calculate CV
+      // Variance = m2 / (n - 1)
+      // CV = sqrt(Variance) / Mean
+      val cv = if (stats.count > 2 && stats.mean > 0) {
+         val variance = stats.m2 / (stats.count - 2) // Sample variance
+         Math.sqrt(variance) / stats.mean
+      } else {
+         0.0
+      }
+
+      (iat, cv)
+    }
+  }
+}

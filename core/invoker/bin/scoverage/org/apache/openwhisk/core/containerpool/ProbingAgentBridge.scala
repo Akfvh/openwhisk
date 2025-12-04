@@ -150,6 +150,9 @@ class ProbingAgentBridge(agentAddress: String,
     // Send add container request to agent (via HTTP or gRPC)
     sendAddContainerRequest(containerId)
 
+    // TODO. calculate probetime dynamically
+    // calculateProbeTime(containerId)
+
     logging.info(this, s"Added container $containerId to probing batch")
   }
 
@@ -174,6 +177,7 @@ class ProbingAgentBridge(agentAddress: String,
 
     val json: JsValue = JsObject(
       "container_id" -> JsString(containerId),
+      "probe_time" -> JsNumber(calculateProbeTime(containerId))
     )
 
     val request = HttpRequest(
@@ -229,6 +233,7 @@ class ProbingAgentBridge(agentAddress: String,
       entity = HttpEntity(ContentTypes.`application/json`, ByteString(json.compactPrint))
     )
 
+
     Http(context.system)
       .singleRequest(request)
       .onComplete {
@@ -239,6 +244,14 @@ class ProbingAgentBridge(agentAddress: String,
         case scala.util.Failure(e) =>
           logging.error(this, s"Error updating probing for container $containerId: ${e.getMessage}")
       }
+  }
+
+  // return probe time in seconds
+  private def calculateProbeTime(containerId: String): Int = {
+    // TODO: Implement logic to calculate probe time dynamically
+    // For now, this is a placeholder - actual implementation depends on agent API
+
+    return 60 * 5 // 5 minutes
   }
 }
 

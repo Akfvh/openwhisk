@@ -246,6 +246,25 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
         runBuffer = runBuffer.enqueue(r)
       }
 
+    case ContainerUpdated(warmData: WarmedData) =>
+      val oldData = freePool.get(sender()).orElse(busyPool.get(sender()))
+
+      oldData match {
+        case Some(oldData) =>
+          val newData = warmData.copy(
+            lastUsed = oldData.lastUsed,
+            activeActivationCount = oldData.activeActivationCount
+          )
+
+          if (freePool.contains(sender())) {
+            freePool = freePool + (sender() -> newData)
+          } else {
+            busyPool = busyPool + (sender() -> newData)
+          }
+        case None =>
+          logging.warn(this, s"received refresh messge for unknown container ${warmData.container.containerId.asString}")
+      }
+
     // Container is free to take more work
     case NeedWork(warmData: WarmedData) =>
       val oldData = freePool.get(sender()).getOrElse(busyPool(sender()))

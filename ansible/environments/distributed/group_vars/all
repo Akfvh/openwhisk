@@ -62,10 +62,11 @@ invoker_user_memory: '1g'
 controller_memory: '2g'
 
 # container timeout
-#containerProxy_timeouts_idleContainer: '10 minutes'
-containerProxy_timeouts_idleContainer: '1 minutes'
-#containerProxy_timeouts_pauseGrace: '30 seconds'
-containerProxy_timeouts_pauseGrace: '2 minutes'
+# Suspends (freezes container)
+containerProxy_timeouts_pauseGrace: '30 seconds'
+# Removes container
+containerProxy_timeouts_idleContainer: '10 minutes'
+#containerProxy_timeouts_idleContainer: '1 minutes'
 
 # limits
 #limit_invocations_per_minute: 300
