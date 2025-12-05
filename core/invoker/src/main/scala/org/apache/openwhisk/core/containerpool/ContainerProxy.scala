@@ -310,6 +310,7 @@ class ContainerProxy(factory: (TransactionId,
   implicit val ec = context.system.dispatcher
   implicit val logging = new AkkaLogging(context.system.log)
   implicit val ac = context.system
+  val parent = context.parent
   var rescheduleJob = false // true iff actor receives a job but cannot process it because actor will destroy itself
   var runBuffer = immutable.Queue.empty[Run] //does not retain order, but does manage jobs that would have pushed past action concurrency limit
   //track buffer processing state to avoid extra transitions near end of buffer - this provides a pseudo-state between Running and Ready
@@ -970,9 +971,31 @@ class ContainerProxy(factory: (TransactionId,
             reschedule)(job.msg.transid)
           .map {
             case (runInterval, response) =>
+              // Hook metrics start
+              val fields = parameters.asJsObject.fields
+              val iat = fields.get("iat").map(_.convertTo[Double]).getOrElse(0.0)
+              val cv = fields.get("cv").map(_.convertTo[Double]).getOrElse(0.0)
+
               val initRunInterval = initInterval
                 .map(i => Interval(runInterval.start.minusMillis(i.duration.toMillis), runInterval.end))
                 .getOrElse(runInterval)
+
+              val runTime: Long = runInterval.duration.toMillis
+              val coldStartTime: Long = if (initRunInterval == runInterval) { // warmstart
+                0L // 0L for easy switch-case upon coldstart decision
+              } else { // coldstart. initInterval.start exists.
+                initInterval.map(i => Interval(job.msg.transid.meta.start, i.start).duration.toMillis).getOrElse(0L)
+              }
+              // Hook metrics end
+
+              // Send update soda score to parent
+              parent ! ContainerProxy.UpdateSodaScore(
+                job.action.fullyQualifiedName(false),
+                iat,
+                cv,
+                coldStartTime,
+                runTime)
+
               ContainerProxy.constructWhiskActivation(
                 job,
                 initInterval,
@@ -1159,6 +1182,14 @@ object ContainerProxy {
         probingAgentBridge
       ))
   case class UpdateMemoryLimit(newLimit: ByteSize)
+
+  case class UpdateSodaScore(
+    action: FullyQualifiedEntityName,
+    iat: Double,
+    cv: Double,
+    initTime: Long,
+    runTime: Long
+  )
 
   // Needs to be thread-safe as it's used by multiple proxies concurrently.
   private val containerCount = new Counter

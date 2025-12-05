@@ -66,6 +66,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
     extends Actor {
   import ContainerPool._
   import ContainerPool.{ContainerMemoryDownsized, CommitsUpdate}
+  import ContainerProxy.UpdateSodaScore
 
   implicit val ec = context.dispatcher
   probingAgentBridge ! ProbingAgentBridge.RegisterPool(self)
@@ -348,6 +349,17 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
     case CommitsUpdate(commits) =>
       updateCommits(commits)
+
+    case UpdateSodaScore(actionName, iat, cv, coldStartTime, runTime) =>
+      val stats = ActionStatsManager.update(
+        actionName.asString,
+        coldStartTime,
+        runTime,
+        iat,
+        cv
+      )
+
+      logging.info(this, s"Action: ${actionName.asString}, newStats: $stats")
   }
 
   /** Resend next item in the buffer, or trigger next item in the feed, if no items in the buffer. */
@@ -640,7 +652,21 @@ object ContainerPool {
       // - there is more memory required
       // - there are still containers that can be removed
       // - there are enough free containers that can be removed
-      val (ref, data) = freeContainers.minBy(_._2.lastUsed)
+
+      // Original: LRU, Until needed size reached
+      // val (ref, data) = freeContainers.minBy(_._2.lastUsed)
+
+      // New: LRU + weight: coldstart sensitivity (+container size)
+      val (ref, data) = freeContainers.minBy { case (_, w: WarmedData) => 
+        val actionName = w.action.fullyQualifiedName(false).asString
+        val stats = ActionStatsManager.get(actionName) // get from global stats map
+        val coldStartSensitivity = stats.map(_.coldstartSensitivity).getOrElse(0.0)
+        val weight = 1.0 + coldStartSensitivity
+
+        // final calculation: LRU * weight
+        w.lastUsed.toEpochMilli.toDouble * weight
+      }
+      
       // Catch exception if remaining memory will be negative
       val remainingMemory = Try(memory - data.memoryLimit).getOrElse(0.B)
       remove(freeContainers - ref, remainingMemory, toRemove ++ List(ref))
