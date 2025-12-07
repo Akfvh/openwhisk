@@ -556,12 +556,12 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   }
 
   private def effectiveMemoryConsumptionOf[A](pool: Map[A, ContainerData]): Long = {
-    logging.info(this, s"downsizedLimits: $downsizedLimits")
-    logging.info(this, s"pool: $pool")
+    logging.debug(this, s"downsizedLimits: $downsizedLimits")
+    logging.debug(this, s"pool: $pool")
     pool.map {
       case (_, w: WarmedData) => 
         val cid = w.container.containerId.asString
-        logging.info(this, s"downsizedLimits.getOrElse(cid, w.memoryLimit): ${downsizedLimits.getOrElse(cid, w.memoryLimit)}")
+        logging.debug(this, s"downsizedLimits.getOrElse(cid, w.memoryLimit): ${downsizedLimits.getOrElse(cid, w.memoryLimit)}")
         downsizedLimits.getOrElse(cid, w.memoryLimit).toMB
       case (_, other) => 
         other.memoryLimit.toMB
@@ -602,7 +602,7 @@ object ContainerPool {
                                            invocationNamespace: EntityName,
                                            idles: Map[A, ContainerData])(implicit logging: Logging): Option[(A, ContainerData)] = {
     // DEBUG: print contents of idles
-    logging.info(this, s"idles: ${idles.mkString("\n")}")
+    logging.debug(this, s"idles: ${idles.mkString("\n")}")
 
     idles
       .find {

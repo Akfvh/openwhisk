@@ -76,7 +76,7 @@ class ProbingAgentBridge(agentAddress: String,
     post {
       entity(as[List[AgentUpdate]]) { updates =>
         if (updates.nonEmpty) {
-          logging.info(this, s"Received ${updates.size} commit updates")
+          logging.debug(this, s"Received ${updates.size} commit updates")
 
           val poolUpdates = updates.map { u =>
             ContainerPool.ContainerMemoryDownsized(u.containerId, u.newLimitBytes.B)
@@ -105,7 +105,7 @@ class ProbingAgentBridge(agentAddress: String,
     ).bindFlow(route)
       .onComplete {
         case Success(binding) =>
-          logging.info(this, s"ProbingAgentBridge HTTP server started at http://0.0.0.0:$listeningHttpPort")
+          logging.debug(this, s"ProbingAgentBridge HTTP server started at http://0.0.0.0:$listeningHttpPort")
         case Failure(e) =>
           logging.error(this, s"Failed to start ProbingAgentBridge HTTP server: ${e.getMessage}")
       }
@@ -114,7 +114,7 @@ class ProbingAgentBridge(agentAddress: String,
   def receive: Receive = {
     case RegisterPool(poolref) =>
       pool = Some(poolref)
-      logging.info(this, "Pool registered")
+      logging.debug(this, "Pool registered")
 
     case StartProbing(containerId) =>
       val proxyRef = sender()
@@ -130,7 +130,7 @@ class ProbingAgentBridge(agentAddress: String,
       // ContainerProxy terminated, remove from active probes
       activeProbes.find(_._2 == ref).foreach { case (containerId, _) =>
         removeContainerFromProbing(containerId)
-        logging.info(this, s"Container $containerId terminated, removed from active probes")
+        logging.debug(this, s"Container $containerId terminated, removed from active probes")
       }
   }
 
@@ -153,7 +153,7 @@ class ProbingAgentBridge(agentAddress: String,
     // TODO. calculate probetime dynamically
     // calculateProbeTime(containerId)
 
-    logging.info(this, s"Added container $containerId to probing batch")
+    logging.debug(this, s"Added container $containerId to probing batch")
   }
 
   private def removeContainerFromProbing(containerId: String): Unit = {
@@ -163,7 +163,7 @@ class ProbingAgentBridge(agentAddress: String,
       
       context.unwatch(proxyRef)
       activeProbes = activeProbes - containerId
-      logging.info(this, s"Removed container $containerId from probing batch")
+      logging.debug(this, s"Removed container $containerId from probing batch")
     }
   }
 

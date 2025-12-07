@@ -443,7 +443,7 @@ class ContainerProxy(factory: (TransactionId,
 
     case Event(UpdateMemoryLimit(newLimit), data: WarmedData) =>
       updateTimeout(newLimit)
-      logging.info(this, s"[RUNNING] Downsizing container ${data.container.containerId.asString} to ${newLimit.toMB} MB")
+      logging.debug(this, s"[RUNNING] Downsizing container ${data.container.containerId.asString} to ${newLimit.toMB} MB")
 
       // update container data
       val newData = data.withMemoryLimit(newLimit)
@@ -575,13 +575,13 @@ class ContainerProxy(factory: (TransactionId,
   when(Ready, stateTimeout = pauseGrace) {
     case Event(UpdateMemoryLimit(newLimit), data: WarmedData) =>
       updateTimeout(newLimit)
-      logging.info(this, s"Downsizing container ${data.container.containerId.asString} to ${newLimit.toMB} MB")
+      logging.debug(this, s"Downsizing container ${data.container.containerId.asString} to ${newLimit.toMB} MB")
 
       // update container data
       val newData = data.withMemoryLimit(newLimit)
 
       // notify the pool to update the container data (majority case, but not guaranteed)
-      logging.info(this, s"[READY](updateMemory) activation count: ${activeCount}")
+      logging.debug(this, s"[READY](updateMemory) activation count: ${activeCount}")
       //context.parent ! NeedWork(newData)
       context.parent ! ContainerUpdated(newData)
       stay using newData
@@ -589,7 +589,7 @@ class ContainerProxy(factory: (TransactionId,
     case Event(job: Run, data: WarmedData) =>
       implicit val transid = job.msg.transid
       activeCount += 1
-      logging.info(this, s"[READY](run) activation count: ${activeCount}")
+      logging.debug(this, s"[READY](run) activation count: ${activeCount}")
       val newData = data.withResumeRun(job)
       initializeAndRun(data.container, job, true)
         .map(_ => RunCompleted)
@@ -618,13 +618,13 @@ class ContainerProxy(factory: (TransactionId,
     case Event(UpdateProbe, data: WarmedData) =>
       val id = data.container.containerId.asString
       probingAgentBridge.foreach(_ ! UpdateProbing(id))
-      logging.info(this, s"Touched container $id")
+      logging.debug(this, s"Touched container $id")
       stay using data
 
     case Event(StopProbe, data: WarmedData) =>
       val id = data.container.containerId.asString
       probingAgentBridge.foreach(_ ! StopProbing(id))
-      logging.info(this, s"Stopping probing for container $id")
+      logging.debug(this, s"Stopping probing for container $id")
       stay using data
   }
 
@@ -632,13 +632,13 @@ class ContainerProxy(factory: (TransactionId,
     // Really unlikely to happen, but just in case.
     case Event(UpdateMemoryLimit(newLimit), data: WarmedData) =>
       updateTimeout(newLimit)
-      logging.info(this, s"[PAUSING] downsizing container ${data.container.containerId.asString} to ${newLimit.toMB} MB")
+      logging.debug(this, s"[PAUSING] downsizing container ${data.container.containerId.asString} to ${newLimit.toMB} MB")
 
       // update container data
       val newData = data.withMemoryLimit(newLimit)
 
       // paused container also lives in the free pool.
-      logging.info(this, s"[PAUSING](updateMemory) activation count: ${activeCount}")
+      logging.debug(this, s"[PAUSING](updateMemory) activation count: ${activeCount}")
       //context.parent ! NeedWork(newData)
       context.parent ! ContainerUpdated(newData)
       stay using newData
@@ -651,13 +651,13 @@ class ContainerProxy(factory: (TransactionId,
     // commit message can also be sent when the container is paused
     case Event(UpdateMemoryLimit(newLimit), data: WarmedData) =>
       updateTimeout(newLimit)
-      logging.info(this, s"[PAUSED] downsizing container ${data.container.containerId.asString} to ${newLimit.toMB} MB")
+      logging.debug(this, s"[PAUSED] downsizing container ${data.container.containerId.asString} to ${newLimit.toMB} MB")
 
       // update container data
       val newData = data.withMemoryLimit(newLimit)
 
       // paused container also lives in the free pool.
-      logging.info(this, s"[PAUSED](updateMemory) activation count: ${activeCount}")
+      logging.debug(this, s"[PAUSED](updateMemory) activation count: ${activeCount}")
       //context.parent ! NeedWork(newData)
       context.parent ! ContainerUpdated(newData)
       stay using newData forMax(myUnusedTimeout)
@@ -682,7 +682,7 @@ class ContainerProxy(factory: (TransactionId,
 
     // container is reclaimed by the pool or it has become too old
     case Event(StateTimeout | Remove, data: WarmedData) =>
-      logging.info(this, s"[PAUSED] container ${data.container.containerId.asString} timed out after ${myUnusedTimeout.toMillis}ms")
+      logging.debug(this, s"[PAUSED] container ${data.container.containerId.asString} timed out after ${myUnusedTimeout.toMillis}ms")
       rescheduleJob = true // to suppress sending message to the pool and not double count
       destroyContainer(data, true)
   }
@@ -742,7 +742,7 @@ class ContainerProxy(factory: (TransactionId,
 
   /** Either process runbuffer or signal parent to send work; return true if runbuffer is being processed */
   def requestWork(newData: WarmedData): Boolean = {
-    logging.info(this, s"[REQUESTWORK] activation count: ${activeCount}")
+    logging.debug(this, s"[REQUESTWORK] activation count: ${activeCount}")
     //if there is concurrency capacity, process runbuffer, signal NeedWork, or both
     if (activeCount < newData.action.limits.concurrency.maxConcurrent) {
       if (runBuffer.nonEmpty) {
@@ -1133,7 +1133,7 @@ class ContainerProxy(factory: (TransactionId,
     } else {
       myUnusedTimeout = 20.seconds
     }
-    logging.info(this, s"[TIMEOUTS] updated unused timeout to ${myUnusedTimeout.toMillis}ms for memory limit ${configuredMemoryLimit.toMB} MB")
+    logging.debug(this, s"[TIMEOUTS] updated unused timeout to ${myUnusedTimeout.toMillis}ms for memory limit ${configuredMemoryLimit.toMB} MB")
   }
 }
 
