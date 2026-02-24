@@ -157,7 +157,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                 .map(container => (container, "prewarmed"))
                 .orElse {
                   // Is there enough space to create a new container or do other containers have to be removed?
-                  if (hasPoolSpaceFor(busyPool ++ freePool ++ prewarmedPool, prewarmStartingPool, memory)) {
+                  if (hasPoolSpaceFor(busyPool ++ freePool ++ prewarmedPool, prewarmStartingPool, memory, downsizedLimits)) {
                     val container = Some(createContainer(memory), "cold")
                     incrementColdStartCount(kind, memory)
                     container
@@ -167,7 +167,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
               // Remove a container and create a new one for the given job
               ContainerPool
               // Only free up the amount, that is really needed to free up
-                .remove(freePool, Math.min(r.action.limits.memory.megabytes, memoryConsumptionOf(freePool)).MB)
+                .remove(freePool, Math.min(r.action.limits.memory.megabytes, memoryConsumptionOf(freePool)).MB, downsizedLimits)(logging)
                 .map(removeContainer)
                 // If the list had at least one entry, enough containers were removed to start the new container. After
                 // removing the containers, we are not interested anymore in the containers that have been removed.
@@ -224,8 +224,8 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
               logging.warn(
                 this,
                 s"Rescheduling Run message, too many message in the pool, " +
-                  s"freePoolSize: ${freePool.size} containers and ${effectiveMemoryConsumptionOf(freePool)} MB, " +
-                  s"busyPoolSize: ${busyPool.size} containers and ${effectiveMemoryConsumptionOf(busyPool)} MB, " +
+                  s"freePoolSize: ${freePool.size} containers (default: ${ContainerPool.memoryConsumptionOf(freePool)} MB, downsized: ${ContainerPool.effectiveMemoryConsumptionOf(freePool, downsizedLimits)} MB), " +
+                  s"busyPoolSize: ${busyPool.size} containers (default: ${ContainerPool.memoryConsumptionOf(busyPool)} MB, downsized: ${ContainerPool.effectiveMemoryConsumptionOf(busyPool, downsizedLimits)} MB), " +
                   s"maxContainersMemory ${poolConfig.userMemory.toMB} MB, " +
                   s"userNamespace: ${r.msg.user.namespace.name}, action: ${r.action}, " +
                   s"needed memory: ${r.action.limits.memory.megabytes} MB, " +
@@ -256,6 +256,13 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             lastUsed = oldData.lastUsed,
             activeActivationCount = oldData.activeActivationCount
           )
+
+          // Update downsizedLimits if downsizedMemory changed
+          // This keeps downsizedLimits in sync with WarmedData.downsizedMemory
+          warmData.downsizedMemory.foreach { downsized =>
+            val containerId = warmData.container.containerId.asString
+            downsizedLimits = downsizedLimits + (containerId -> downsized)
+          }
 
           if (freePool.contains(sender())) {
             freePool = freePool + (sender() -> newData)
@@ -355,11 +362,14 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
         actionName.asString,
         coldStartTime,
         runTime,
-        iat,
-        cv
+        iat,  // From controller (measured at request arrival time)
+        cv    // From controller (calculated using Welford's algorithm)
       )
 
-      logging.info(this, s"Action: ${actionName.asString}, newStats: $stats")
+      logging.info(this, 
+        s"Action: ${actionName.asString}, newStats: count=${stats.count}, " +
+        s"coldCount=${stats.coldCount}, avgInit=${stats.avgInit}ms, avgRun=${stats.avgRun}ms, " +
+        s"iat=${stats.iat}s, cv=${stats.cv}, sensitivity=${stats.coldstartSensitivity}")
   }
 
   /** Resend next item in the buffer, or trigger next item in the feed, if no items in the buffer. */
@@ -425,7 +435,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
   /** Creates a new prewarmed container */
   def prewarmContainer(exec: CodeExec[_], memoryLimit: ByteSize, ttl: Option[FiniteDuration]): Unit = {
-    if (hasPoolSpaceFor(busyPool ++ freePool ++ prewarmedPool, prewarmStartingPool, memoryLimit)) {
+    if (hasPoolSpaceFor(busyPool ++ freePool ++ prewarmedPool, prewarmStartingPool, memoryLimit, downsizedLimits)) {
       val newContainer = childFactory(context)
       prewarmStartingPool = prewarmStartingPool + (newContainer -> (exec.kind, memoryLimit))
       newContainer ! Start(exec, memoryLimit, ttl)
@@ -501,8 +511,21 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
    */
   def hasPoolSpaceFor[A](pool: Map[A, ContainerData],
                          prewarmStartingPool: Map[A, (String, ByteSize)],
-                         memory: ByteSize): Boolean = {
-    effectiveMemoryConsumptionOf(pool) + prewarmStartingPool.map(_._2._2.toMB).sum + memory.toMB <= poolConfig.userMemory.toMB
+                         memory: ByteSize,
+                         downsizedLimits: Map[String, ByteSize]): Boolean = {
+    val defaultMemory = ContainerPool.memoryConsumptionOf(pool)
+    val downsizedMemory = ContainerPool.effectiveMemoryConsumptionOf(pool, downsizedLimits)
+    val prewarmMemory = prewarmStartingPool.map(_._2._2.toMB).sum
+    val requestedMemory = memory.toMB
+    val totalMemory = downsizedMemory + prewarmMemory + requestedMemory
+    val hasSpace = totalMemory <= poolConfig.userMemory.toMB
+    
+    logging.debug(this, 
+      s"hasPoolSpaceFor check: default=${defaultMemory}MB, downsized=${downsizedMemory}MB, " +
+      s"prewarm=${prewarmMemory}MB, requested=${requestedMemory}MB, " +
+      s"total=${totalMemory}MB, limit=${poolConfig.userMemory.toMB}MB, hasSpace=${hasSpace}")
+    
+    hasSpace
   }
 
   /**
@@ -528,12 +551,37 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
     val unusedMB = unused.map(_._2.memoryLimit.toMB).sum
     MetricEmitter.emitGaugeMetric(LoggingMarkers.CONTAINER_POOL_IDLES_COUNT, unused.size)
     MetricEmitter.emitGaugeMetric(LoggingMarkers.CONTAINER_POOL_IDLES_SIZE, unusedMB)
+    
+    // Log default vs downsized memory comparison
+    val freeDefault = ContainerPool.memoryConsumptionOf(freePool)
+    val freeDownsized = ContainerPool.effectiveMemoryConsumptionOf(freePool, downsizedLimits)
+    val busyDefault = ContainerPool.memoryConsumptionOf(busyPool)
+    val busyDownsized = ContainerPool.effectiveMemoryConsumptionOf(busyPool, downsizedLimits)
+    val totalDefault = freeDefault + busyDefault
+    val totalDownsized = freeDownsized + busyDownsized
+    val totalSavings = totalDefault - totalDownsized
+    
+    // Debug: log downsizedLimits map contents
+    val downsizedCount = downsizedLimits.size
+    val downsizedTotal = downsizedLimits.values.map(_.toMB).sum
+    val freePoolWarmedCount = freePool.values.count(_.isInstanceOf[WarmedData])
+    val busyPoolWarmedCount = busyPool.values.count(_.isInstanceOf[WarmedData])
+    
+    logging.info(this, 
+      s"Pool memory metrics: freePool(default=${freeDefault}MB, downsized=${freeDownsized}MB, containers=${freePool.size}, warmed=${freePoolWarmedCount}), " +
+      s"busyPool(default=${busyDefault}MB, downsized=${busyDownsized}MB, containers=${busyPool.size}, warmed=${busyPoolWarmedCount}), " +
+      s"total(default=${totalDefault}MB, downsized=${totalDownsized}MB, savings=${totalSavings}MB), " +
+      s"downsizedLimits(count=${downsizedCount}, total=${downsizedTotal}MB)")
   }
 
   /** Updates the memory limit of the containers in the pool */
   // 1. Send each containerproxy a message to update the memory limit
-  // 2. Update the container data in the pool
+  // 2. Update the container data in the pool (WarmedData.downsizedMemory)
+  // 3. Update downsizedLimits map for effectiveMemoryConsumptionOf calculation
+  // Note: WarmedData.memoryLimit is NOT changed - it remains as action.limits.memory.megabytes.MB
+  //       to allow schedule() to match containers by action memory requirement
   def updateCommits(commits: List[ContainerMemoryDownsized]): Unit = {
+    // logging.info(this, s"updateCommits called with ${commits.size} commits")
     commits.foreach { commit =>
       val newLimit = commit.newLimitBytes
       val containerId = commit.containerId
@@ -544,7 +592,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             // request update to containerproxy
             ref ! ContainerProxy.UpdateMemoryLimit(newLimit)
 
-            // update pool manually
+            // update pool manually (downsizedMemory only, memoryLimit stays as action requirement)
             ref -> w.withDownsizedMemory(newLimit)
           case other => other
         }
@@ -552,21 +600,43 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
       freePool = updatePool(freePool)
       busyPool = updatePool(busyPool)
+      
+      // Update downsizedLimits map to keep it in sync with WarmedData.downsizedMemory
+      // This ensures effectiveMemoryConsumptionOf uses the correct actual memory limit
+      // Check if container exists in either pool before updating downsizedLimits
+      val containerInFreePool = freePool.values.exists {
+        case w: WarmedData => w.container.containerId.asString == containerId
+        case _ => false
+      }
+      val containerInBusyPool = busyPool.values.exists {
+        case w: WarmedData => w.container.containerId.asString == containerId
+        case _ => false
+      }
+      
+      if (containerInFreePool || containerInBusyPool) {
+        val oldLimit = downsizedLimits.get(containerId)
+        downsizedLimits = downsizedLimits + (containerId -> newLimit)
+        
+        // Log memory update with default vs downsized comparison
+        val defaultLimit = freePool.values.collectFirst {
+          case w: WarmedData if w.container.containerId.asString == containerId => w.memoryLimit.toMB
+        }.orElse(busyPool.values.collectFirst {
+          case w: WarmedData if w.container.containerId.asString == containerId => w.memoryLimit.toMB
+        }).getOrElse(0L)
+        
+        // logging.info(this, 
+        //   s"updateCommits: container=${containerId}, default=${defaultLimit}MB, " +
+        //   s"oldDownsized=${oldLimit.map(_.toMB).getOrElse(defaultLimit)}MB, " +
+        //   s"newDownsized=${newLimit.toMB}MB, savings=${defaultLimit - newLimit.toMB}MB, " +
+        //   s"inFreePool=${containerInFreePool}, inBusyPool=${containerInBusyPool}")
+      } else {
+        logging.warn(this, 
+          s"updateCommits: container ${containerId} not found in freePool or busyPool. " +
+          s"freePool size=${freePool.size}, busyPool size=${busyPool.size}")
+      }
     }
   }
 
-  private def effectiveMemoryConsumptionOf[A](pool: Map[A, ContainerData]): Long = {
-    logging.debug(this, s"downsizedLimits: $downsizedLimits")
-    logging.debug(this, s"pool: $pool")
-    pool.map {
-      case (_, w: WarmedData) => 
-        val cid = w.container.containerId.asString
-        logging.debug(this, s"downsizedLimits.getOrElse(cid, w.memoryLimit): ${downsizedLimits.getOrElse(cid, w.memoryLimit)}")
-        downsizedLimits.getOrElse(cid, w.memoryLimit).toMB
-      case (_, other) => 
-        other.memoryLimit.toMB
-    }.sum
-  }
 }
 
 object ContainerPool {
@@ -581,6 +651,23 @@ object ContainerPool {
    */
   protected[containerpool] def memoryConsumptionOf[A](pool: Map[A, ContainerData]): Long = {
     pool.map(_._2.memoryLimit.toMB).sum
+  }
+
+  /**
+   * Calculate the effective memory consumption of a pool, accounting for downsized containers.
+   *
+   * @param pool The pool with the containers.
+   * @param downsizedLimits Map of container IDs to their downsized memory limits.
+   * @return The effective memory consumption of all containers in the pool in Megabytes.
+   */
+  protected[containerpool] def effectiveMemoryConsumptionOf[A](pool: Map[A, ContainerData], downsizedLimits: Map[String, ByteSize]): Long = {
+    pool.map {
+      case (_, w: WarmedData) => 
+        val cid = w.container.containerId.asString
+        downsizedLimits.getOrElse(cid, w.memoryLimit).toMB
+      case (_, other) => 
+        other.memoryLimit.toMB
+    }.sum
   }
 
   /**
@@ -632,12 +719,15 @@ object ContainerPool {
    *
    * @param pool a map of all free containers in the pool
    * @param memory the amount of memory that has to be freed up
+   * @param downsizedLimits map of container IDs to their downsized memory limits
+   * @param toRemove list of containers already marked for removal
    * @return a list of containers to be removed iff found
    */
   @tailrec
   protected[containerpool] def remove[A](pool: Map[A, ContainerData],
                                          memory: ByteSize,
-                                         toRemove: List[A] = List.empty): List[A] = {
+                                         downsizedLimits: Map[String, ByteSize] = Map.empty,
+                                         toRemove: List[A] = List.empty)(implicit logging: Logging): List[A] = {
     // TODO. New eviction policy:
     // LRU + weight
     // Try to find a Free container that does NOT have any active activations AND is initialized with any OTHER action
@@ -647,29 +737,115 @@ object ContainerPool {
         ref -> w
     }
 
-    if (memory > 0.B && freeContainers.nonEmpty && memoryConsumptionOf(freeContainers) >= memory.toMB) {
+    // Use effectiveMemoryConsumptionOf to account for downsized containers
+    // This ensures we calculate the actual memory being freed correctly
+    val defaultFreeMemory = memoryConsumptionOf(freeContainers)
+    val downsizedFreeMemory = ContainerPool.effectiveMemoryConsumptionOf(freeContainers, downsizedLimits)
+    val neededMemory = memory.toMB
+    
+    if (memory > 0.B && freeContainers.nonEmpty && downsizedFreeMemory >= neededMemory) {
+      // Note: Logging removed here since remove is in object ContainerPool without logging access
+      // Memory calculation logging can be done at the call site if needed
       // Remove the oldest container if:
       // - there is more memory required
       // - there are still containers that can be removed
       // - there are enough free containers that can be removed
 
-      // Original: LRU, Until needed size reached
-      // val (ref, data) = freeContainers.minBy(_._2.lastUsed)
-
-      // New: LRU + weight: coldstart sensitivity (+container size)
+      // Eviction policy: Multi-factor scoring based on ActionStats
+      // Score = baseEvictionScore + retentionBonus
+      // Lower score = higher priority for eviction
       val (ref, data) = freeContainers.minBy { case (_, w: WarmedData) => 
         val actionName = w.action.fullyQualifiedName(false).asString
-        val stats = ActionStatsManager.get(actionName) // get from global stats map
-        val coldStartSensitivity = stats.map(_.coldstartSensitivity).getOrElse(0.0)
-        val weight = 1.0 + coldStartSensitivity
-
-        // final calculation: LRU * weight
-        w.lastUsed.toEpochMilli.toDouble * weight
+        val stats = ActionStatsManager.get(actionName)
+        
+        // Base eviction score: LRU (last used time in milliseconds)
+        val baseScore = w.lastUsed.toEpochMilli.toDouble
+        
+        // Retention bonus: factors that make container worth keeping
+        // Higher bonus = less likely to be evicted
+        // Small bonuses to preserve LRU dominance in eviction decisions
+        val retentionBonus = stats.map { s =>
+          // Factor 1: Cold start sensitivity (avgInit / avgRun)
+          // Higher sensitivity = more expensive cold starts = keep longer
+          // Range: 0.0 to ~10.0 (typical: 0.1-2.0)
+          // Small bonus: sensitivity of 2.0 = 5s bonus (max)
+          val coldStartSensitivity = s.coldstartSensitivity
+          val coldStartBonus = (coldStartSensitivity / 2.0).min(1.0) * 5000.0 // Max 5 seconds
+          
+          // Factor 2: Inter-arrival time (IAT)
+          // Shorter IAT = more frequent invocations = keep longer
+          // Small bonus: IAT of 1s = 5s bonus, IAT of 3600s = 0.08s bonus
+          val iatBonus = if (s.iat > 0) {
+            // Inverse relationship: 5 / (1 + iat/30)
+            // IAT of 1s = 4.8s, IAT of 60s = 1.7s, IAT of 3600s = 0.08s
+            (5.0 / (1.0 + s.iat / 30.0)) * 1000.0 // Convert to milliseconds
+          } else {
+            5000.0 // Very frequent (max bonus = 5 seconds)
+          }
+          
+          // Factor 3a: Actual memory size (what pool sees) - smaller memory gets larger bonus
+          // Smaller containers are preferred to keep (less memory footprint)
+          // actualMemory is the effective memory (downsized if applicable, otherwise memoryLimit)
+          // Small bonus: 128MB = 5s bonus (max), 2048MB = 0.3s bonus
+          val actualMemory = downsizedLimits.get(w.container.containerId.asString)
+            .map(_.toMB)
+            .getOrElse(w.memoryLimit.toMB)
+          val memorySizeBonus = {
+            if (actualMemory > 0) {
+              // Inverse: smaller actual memory = larger bonus
+              // 128MB = 2.5s, 256MB = 1.7s, 512MB = 1.0s, 1024MB = 0.6s, 2048MB = 0.3s
+              (5.0 / (1.0 + actualMemory / 128.0)) * 1000.0 // Convert to milliseconds
+            } else {
+              0.0
+            }
+          }
+          
+          // Factor 3b: Effective memory (downsized) - very small bonus only
+          // Containers with downsized memory get a tiny additional retention bonus
+          val effectiveMemoryBonus = if (actualMemory < w.memoryLimit.toMB && w.memoryLimit.toMB > 0) {
+            // Very small bonus for downsized containers (max 2s = 2000ms)
+            val downsizingRatio = (w.memoryLimit.toMB - actualMemory).toDouble / w.memoryLimit.toMB
+            downsizingRatio * 2000.0 // Max 2 seconds for 100% downsizing
+          } else {
+            0.0
+          }
+          
+          // Weighted sum with balanced contributions
+          // Each factor contributes small bonuses, total max ~17s
+          // LRU (baseScore) remains the dominant factor in eviction decisions
+          coldStartBonus * 0.33 +      // 33% weight
+          iatBonus * 0.33 +             // 33% weight
+          memorySizeBonus * 0.30 +      // 30% weight (actual memory size)
+          effectiveMemoryBonus * 0.04   // 4% weight (effective memory - very small bonus)
+        }.getOrElse(0.0)
+        
+        // Final score: base score minus retention bonus
+        // Lower score = evict first
+        baseScore - retentionBonus
       }
       
+      // Log eviction victim
+      data match {
+        case w: WarmedData =>
+          val actionName = w.action.fullyQualifiedName(false).asString
+          logging.info(this, s"[EVICTION] Removing container (action: ${actionName})")
+        case other =>
+          logging.info(this, s"[EVICTION] Removing container (type: ${other.getClass.getSimpleName})")
+      }
+      
+      // Original: LRU, Until needed size reached (DISABLED - using weighted LRU)
+      // val (ref, data) = freeContainers.minBy(_._2.lastUsed)
+      
       // Catch exception if remaining memory will be negative
-      val remainingMemory = Try(memory - data.memoryLimit).getOrElse(0.B)
-      remove(freeContainers - ref, remainingMemory, toRemove ++ List(ref))
+      // Use actual downsized memory if available, otherwise use memoryLimit
+      val actualMemory = data match {
+        case w: WarmedData => 
+          val cid = w.container.containerId.asString
+          downsizedLimits.getOrElse(cid, w.memoryLimit)
+        case other => other.memoryLimit
+      }
+      val remainingMemory = Try(memory - actualMemory).getOrElse(0.B)
+      remove(freeContainers - ref, remainingMemory, downsizedLimits, toRemove ++ List(ref))
     } else {
       // If this is the first call: All containers are in use currently, or there is more memory needed than
       // containers can be removed.

@@ -39,6 +39,13 @@ object ProbingAgentBridgeProtocol extends DefaultJsonProtocol {
   )
   implicit val agentUpdateFormat: RootJsonFormat[AgentUpdate] =
     jsonFormat2(AgentUpdate)
+  
+  final case class AgentProbeDisabled(
+    container_id: String,
+    reason: String
+  )
+  implicit val agentProbeDisabledFormat: RootJsonFormat[AgentProbeDisabled] =
+    jsonFormat2(AgentProbeDisabled.apply)
 }
 
 /**
@@ -72,28 +79,43 @@ class ProbingAgentBridge(agentAddress: String,
   private var pool: Option[ActorRef] = None
   
   // HTTP route: agent push endpoint for commits
-  val route: Route = path("updateCommits") {
-    post {
-      entity(as[List[AgentUpdate]]) { updates =>
-        if (updates.nonEmpty) {
-          logging.debug(this, s"Received ${updates.size} commit updates")
+  val route: Route = 
+    path("updateCommits") {
+      post {
+        entity(as[List[AgentUpdate]]) { updates =>
+          if (updates.nonEmpty) {
+            logging.debug(this, s"Received ${updates.size} commit updates")
 
-          val poolUpdates = updates.map { u =>
-            ContainerPool.ContainerMemoryDownsized(u.containerId, u.newLimitBytes.B)
+            val poolUpdates = updates.map { u =>
+              ContainerPool.ContainerMemoryDownsized(u.containerId, u.newLimitBytes.B)
+            }
+
+            pool match {
+              case Some(p) => 
+                p ! ContainerPool.CommitsUpdate(poolUpdates)
+              case None =>
+                logging.warn(this, "Pool not set, skipping commit updates")
+            }
           }
 
-          pool match {
-            case Some(p) => 
-              p ! ContainerPool.CommitsUpdate(poolUpdates)
-            case None =>
-              logging.warn(this, "Pool not set, skipping commit updates")
-          }
+          complete(StatusCodes.OK)
         }
-
-        complete(StatusCodes.OK)
+      }
+    } ~
+    path("probeDisabled") {
+      post {
+        entity(as[AgentProbeDisabled]) { disabled =>
+          // logging.info(this, s"Received probe disabled notification for container ${disabled.container_id}, reason: ${disabled.reason}")
+          
+          activeProbes.get(disabled.container_id).foreach { proxyRef =>
+            proxyRef ! ProbeDisabled(disabled.reason)
+            // logging.debug(this, s"Forwarded probe disabled message to ContainerProxy for ${disabled.container_id}")
+          }
+          
+          complete(StatusCodes.OK)
+        }
       }
     }
-  }
 
   override def preStart(): Unit = {
     super.preStart()
@@ -105,20 +127,58 @@ class ProbingAgentBridge(agentAddress: String,
     ).bindFlow(route)
       .onComplete {
         case Success(binding) =>
-          logging.debug(this, s"ProbingAgentBridge HTTP server started at http://0.0.0.0:$listeningHttpPort")
+          // logging.debug(this, s"ProbingAgentBridge HTTP server started at http://0.0.0.0:$listeningHttpPort")
         case Failure(e) =>
           logging.error(this, s"Failed to start ProbingAgentBridge HTTP server: ${e.getMessage}")
+      }
+    
+    // Warm up HTTP connection to agent to avoid first-request delay
+    // This establishes the connection pool early, reducing latency for the first actual request
+    warmupAgentConnection()
+  }
+  
+  private def warmupAgentConnection(): Unit = {
+    // Try to establish connection early by sending a lightweight request
+    // This pre-warms the connection pool and reduces first-request latency
+    val healthRequest = HttpRequest(
+      method = HttpMethods.GET,
+      uri = s"http://$agentAddress:$agentHttpPort/health" // Try health endpoint first
+    )
+    
+    Http(context.system)
+      .singleRequest(healthRequest)
+      .onComplete {
+        case Success(response) =>
+          response.discardEntityBytes()
+          // logging.debug(this, s"Warmed up connection to agent at $agentAddress:$agentHttpPort via health endpoint")
+        case Failure(_) =>
+          // Health endpoint might not exist, try a lightweight request to containers endpoint
+          // This still establishes the connection pool
+          val dummyRequest = HttpRequest(
+            method = HttpMethods.GET,
+            uri = s"http://$agentAddress:$agentHttpPort/containers" // Might return 404, but establishes connection
+          )
+          Http(context.system)
+            .singleRequest(dummyRequest)
+            .onComplete {
+              case Success(response) =>
+                response.discardEntityBytes()
+                // logging.debug(this, s"Warmed up connection to agent at $agentAddress:$agentHttpPort")
+              case Failure(e) =>
+                // Connection will be established on first real request
+                // logging.debug(this, s"Connection warmup failed (will establish on first request): ${e.getMessage}")
+            }
       }
   }
 
   def receive: Receive = {
     case RegisterPool(poolref) =>
       pool = Some(poolref)
-      logging.debug(this, "Pool registered")
+      // logging.debug(this, "Pool registered")
 
-    case StartProbing(containerId) =>
+    case StartProbing(containerId, stats) =>
       val proxyRef = sender()
-      addContainerToProbing(containerId, proxyRef)
+      addContainerToProbing(containerId, proxyRef, stats)
 
     case StopProbing(containerId) =>
       removeContainerFromProbing(containerId)
@@ -130,12 +190,13 @@ class ProbingAgentBridge(agentAddress: String,
       // ContainerProxy terminated, remove from active probes
       activeProbes.find(_._2 == ref).foreach { case (containerId, _) =>
         removeContainerFromProbing(containerId)
-        logging.debug(this, s"Container $containerId terminated, removed from active probes")
+        // logging.debug(this, s"Container $containerId terminated, removed from active probes")
       }
   }
 
   private def addContainerToProbing(containerId: String,
-                                    proxyRef: ActorRef): Unit = {
+                                    proxyRef: ActorRef,
+                                    stats: Option[ActionStats]): Unit = {
     if (activeProbes.contains(containerId)) {
       logging.warn(this, s"Probing already active for container $containerId")
       return
@@ -148,12 +209,12 @@ class ProbingAgentBridge(agentAddress: String,
     activeProbes = activeProbes + (containerId -> proxyRef)
 
     // Send add container request to agent (via HTTP or gRPC)
-    sendAddContainerRequest(containerId)
+    sendAddContainerRequest(containerId, stats)
 
     // TODO. calculate probetime dynamically
     // calculateProbeTime(containerId)
 
-    logging.debug(this, s"Added container $containerId to probing batch")
+    // logging.debug(this, s"Added container $containerId to probing batch")
   }
 
   private def removeContainerFromProbing(containerId: String): Unit = {
@@ -168,17 +229,26 @@ class ProbingAgentBridge(agentAddress: String,
   }
 
 
-  private def sendAddContainerRequest(containerId: String): Unit = {
-    // TODO: Implement HTTP call to agent to add container to monitoring batch
-    // For now, this is a placeholder - actual implementation depends on agent API
-    // Example HTTP call:
-    // POST http://localhost:${agentHttpPort}/containers/add
-    // Body: { "container_id": containerId }
-
-    val json: JsValue = JsObject(
+  private def sendAddContainerRequest(containerId: String, stats: Option[ActionStats]): Unit = {
+    // Build JSON request with ActionStats metrics for probing parameter adjustment
+    var fields = Map(
       "container_id" -> JsString(containerId),
       "probe_time" -> JsNumber(calculateProbeTime(containerId))
     )
+    
+    // Add ActionStats metrics if available (only essential metrics)
+    stats.foreach { s =>
+      fields = fields ++ Map(
+        "coldstart_sensitivity" -> JsNumber(s.coldstartSensitivity),
+        "iat" -> JsNumber(s.iat),
+        "cv" -> JsNumber(s.cv)
+      )
+      logging.debug(this, 
+        s"Sending ActionStats for container $containerId: " +
+        s"sensitivity=${s.coldstartSensitivity}, iat=${s.iat}s, cv=${s.cv}")
+    }
+
+    val json: JsValue = JsObject(fields)
 
     val request = HttpRequest(
       method = HttpMethods.POST,
@@ -224,6 +294,13 @@ class ProbingAgentBridge(agentAddress: String,
 
   // We "touch" the container to let the agent know invocation happened
   private def sendUpdateProbingRequest(containerId: String): Unit = {
+    // Only send update request if container is actively being probed
+    // This prevents sending requests for containers that have been removed
+    if (!activeProbes.contains(containerId)) {
+      logging.debug(this, s"Skipping update probing request for container $containerId (not in active probes)")
+      return
+    }
+    
     val json: JsValue = JsObject(
       "container_id" -> JsString(containerId)
     )
@@ -258,9 +335,12 @@ class ProbingAgentBridge(agentAddress: String,
 object ProbingAgentBridge {
 
     // messages: ContainerProxy -> bridge
-    final case class StartProbing(containerId: String)
+    final case class StartProbing(containerId: String, stats: Option[ActionStats] = None)
     final case class StopProbing(containerId: String)   
     final case class UpdateProbing(containerId: String)
+    
+    // messages: bridge -> ContainerProxy
+    final case class ProbeDisabled(reason: String)
 
     final case class RegisterPool(poolref: ActorRef)
 

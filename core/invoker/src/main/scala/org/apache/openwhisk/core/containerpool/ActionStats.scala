@@ -4,7 +4,16 @@ import java.util.concurrent.ConcurrentHashMap
 
 
 // ActionStats data structure
-case class ActionStats(count: Long, coldCount: Long, avgInit: Double, avgRun: Double, iat: Double, cv: Double) {
+// IAT and CV are provided by controller (measured at request arrival time)
+// This is more accurate than measuring at invoker execution completion time
+case class ActionStats(
+    count: Long, 
+    coldCount: Long, 
+    avgInit: Double, 
+    avgRun: Double, 
+    iat: Double,      // Latest IAT from controller
+    cv: Double        // Latest CV from controller
+) {
     // coldstart sensitivity: init time / runtime
     def coldstartSensitivity: Double = if (avgRun > 0) { avgInit / avgRun } else 0.0 
 
@@ -22,6 +31,8 @@ case class ActionStats(count: Long, coldCount: Long, avgInit: Double, avgRun: Do
 
         val newAvgRun = avgRun + (newRun - avgRun) / newCount
 
+        // IAT and CV are from controller - use the latest values
+        // Controller uses Welford's algorithm for accurate CV calculation
         ActionStats(newCount, newColdCount, newAvgInit, newAvgRun, newIat, newCv)
     }
 }
@@ -38,10 +49,17 @@ object ActionStatsManager {
     def update(actionName: String, newInit: Double, newRun: Double, newIat: Double, newCv: Double): ActionStats = {
         stats.compute(actionName, (_, currentStats) => {
             if (currentStats == null) {
-                // create new
-                ActionStats(1, if(newInit > 0) 1 else 0, newInit, newRun, newIat, newCv)
+                // create new - first invocation
+                ActionStats(
+                    count = 1, 
+                    coldCount = if(newInit > 0) 1 else 0, 
+                    avgInit = newInit, 
+                    avgRun = newRun, 
+                    iat = newIat,  // From controller
+                    cv = newCv     // From controller
+                )
             } else {
-                // update
+                // update - IAT and CV are from controller (measured at request arrival time)
                 currentStats.update(newInit, newRun, newIat, newCv)
             }
         })

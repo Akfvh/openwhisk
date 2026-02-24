@@ -55,7 +55,7 @@ function gen_cert(){
 }
 
 function gen_p12_keystore(){
-  openssl pkcs12 -export -name $CN \
+  openssl pkcs12 -export -legacy -name $CN \
        -passout pass:$TRUSTSTORE_PASSWORD \
        -in "$SCRIPTDIR/${NAME_PREFIX}openwhisk-server-cert.pem" \
        -inkey "$SCRIPTDIR/${NAME_PREFIX}openwhisk-server-key.pem" \

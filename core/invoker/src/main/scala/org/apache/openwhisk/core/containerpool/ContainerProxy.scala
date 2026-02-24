@@ -39,7 +39,6 @@ import java.net.SocketException
 
 import org.apache.openwhisk.common.MetricEmitter
 import org.apache.openwhisk.common.TransactionId.systemPrefix
-import org.apache.openwhisk.core.containerpool.ProbingAgentBridge.{StartProbing, StopProbing}
 
 import scala.collection.immutable
 import spray.json.DefaultJsonProtocol._
@@ -304,7 +303,7 @@ class ContainerProxy(factory: (TransactionId,
     extends FSM[ContainerState, ContainerData]
     with Stash {
   
-  import ProbingAgentBridge._
+  import ProbingAgentBridge.{StartProbing, StopProbing, UpdateProbing}
   import ContainerProxy.UpdateMemoryLimit
 
   implicit val ec = context.system.dispatcher
@@ -443,12 +442,14 @@ class ContainerProxy(factory: (TransactionId,
 
     case Event(UpdateMemoryLimit(newLimit), data: WarmedData) =>
       updateTimeout(newLimit)
-      logging.debug(this, s"[RUNNING] Downsizing container ${data.container.containerId.asString} to ${newLimit.toMB} MB")
+      // logging.debug(this, s"[RUNNING] Downsizing container ${data.container.containerId.asString} to ${newLimit.toMB} MB")
 
       // update container data
       val newData = data.withMemoryLimit(newLimit)
 
-      // don't notify while running, will be notified when we go to Ready state
+      // Notify pool immediately even while running to ensure accurate memory calculation
+      // This prevents pool from using stale memory limits during scheduling decisions
+      context.parent ! ContainerUpdated(newData)
       stay using newData
 
 
@@ -492,6 +493,7 @@ class ContainerProxy(factory: (TransactionId,
         } else if (probeState == ProbeRunning) {
           self ! UpdateProbe
         }
+        // ProbeDisabled 상태에서는 update 요청을 보내지 않음
         goto(Ready) using newData
       }
     case Event(job: Run, data: WarmedData)
@@ -575,13 +577,13 @@ class ContainerProxy(factory: (TransactionId,
   when(Ready, stateTimeout = pauseGrace) {
     case Event(UpdateMemoryLimit(newLimit), data: WarmedData) =>
       updateTimeout(newLimit)
-      logging.debug(this, s"Downsizing container ${data.container.containerId.asString} to ${newLimit.toMB} MB")
+      // logging.debug(this, s"Downsizing container ${data.container.containerId.asString} to ${newLimit.toMB} MB")
 
       // update container data
       val newData = data.withMemoryLimit(newLimit)
 
       // notify the pool to update the container data (majority case, but not guaranteed)
-      logging.debug(this, s"[READY](updateMemory) activation count: ${activeCount}")
+      // logging.debug(this, s"[READY](updateMemory) activation count: ${activeCount}")
       //context.parent ! NeedWork(newData)
       context.parent ! ContainerUpdated(newData)
       stay using newData
@@ -589,7 +591,7 @@ class ContainerProxy(factory: (TransactionId,
     case Event(job: Run, data: WarmedData) =>
       implicit val transid = job.msg.transid
       activeCount += 1
-      logging.debug(this, s"[READY](run) activation count: ${activeCount}")
+      // logging.debug(this, s"[READY](run) activation count: ${activeCount}")
       val newData = data.withResumeRun(job)
       initializeAndRun(data.container, job, true)
         .map(_ => RunCompleted)
@@ -611,7 +613,10 @@ class ContainerProxy(factory: (TransactionId,
     // We start probing when the containers are in ready state only
     case Event(StartProbe, data: WarmedData) =>
       val id = data.container.containerId.asString
-      probingAgentBridge.foreach(_ ! StartProbing(id))
+      val actionName = data.action.fullyQualifiedName(false)
+      // Get ActionStats metrics for probing parameter adjustment
+      val stats = ActionStatsManager.get(actionName.asString)
+      probingAgentBridge.foreach(_ ! StartProbing(id, stats))
       probeState = ProbeRunning
       stay using data
 
@@ -625,6 +630,11 @@ class ContainerProxy(factory: (TransactionId,
       val id = data.container.containerId.asString
       probingAgentBridge.foreach(_ ! StopProbing(id))
       logging.debug(this, s"Stopping probing for container $id")
+      stay using data
+    
+    case Event(ProbingAgentBridge.ProbeDisabled(reason), data: WarmedData) =>
+      probeState = ProbeDisabled
+      logging.info(this, s"Probing disabled for container ${data.container.containerId.asString}, reason: $reason")
       stay using data
   }
 
@@ -713,6 +723,12 @@ class ContainerProxy(factory: (TransactionId,
       } else {
         stay using newData
       }
+    // Handle StopProbe message that may arrive after state transition to Removing
+    case Event(StopProbe, data: WarmedData) =>
+      val id = data.container.containerId.asString
+      probingAgentBridge.foreach(_ ! StopProbing(id))
+      logging.debug(this, s"[REMOVING] Stopping probing for container $id")
+      stay using data
   }
 
   // Unstash all messages stashed while in intermediate state
@@ -972,6 +988,9 @@ class ContainerProxy(factory: (TransactionId,
           .map {
             case (runInterval, response) =>
               // Hook metrics start
+              // Get IAT and CV from parameters (calculated by controller)
+              // Controller measures IAT at request arrival time, which is more accurate
+              // than measuring at invoker execution completion time
               val fields = parameters.asJsObject.fields
               val iat = fields.get("iat").map(_.convertTo[Double]).getOrElse(0.0)
               val cv = fields.get("cv").map(_.convertTo[Double]).getOrElse(0.0)
@@ -989,6 +1008,7 @@ class ContainerProxy(factory: (TransactionId,
               // Hook metrics end
 
               // Send update soda score to parent
+              // IAT and CV are from controller (measured at request arrival time)
               parent ! ContainerProxy.UpdateSodaScore(
                 job.action.fullyQualifiedName(false),
                 iat,
@@ -1122,18 +1142,13 @@ class ContainerProxy(factory: (TransactionId,
 
   private def updateTimeout(configuredMemoryLimit: ByteSize) = {
     // give small containers more time to stay alive
-    if (configuredMemoryLimit < 64.MB) {
-      myUnusedTimeout = 3.minutes
-    } else if (configuredMemoryLimit < 128.MB) {
-      myUnusedTimeout = 2.minutes
-    } else if (configuredMemoryLimit < 256.MB) {
-      myUnusedTimeout = 1.minute
-    } else if (configuredMemoryLimit < 512.MB) {
-      myUnusedTimeout = 30.seconds
-    } else {
-      myUnusedTimeout = 20.seconds
-    }
-    logging.debug(this, s"[TIMEOUTS] updated unused timeout to ${myUnusedTimeout.toMillis}ms for memory limit ${configuredMemoryLimit.toMB} MB")
+    // Continuous function: timeout = 10 + 10 / (1 + memoryMB / 128)
+    // Smaller memory = longer keep-alive time
+    // Examples: 64MB = 18.3min, 128MB = 15min, 256MB = 12.2min, 512MB = 10.7min, 1024MB+ = ~10min
+    val memoryMB = configuredMemoryLimit.toMB
+    val timeoutMinutes = 10.0 + 10.0 / (1.0 + memoryMB / 128.0)
+    myUnusedTimeout = timeoutMinutes.minutes
+    logging.debug(this, s"[TIMEOUTS] updated unused timeout to ${myUnusedTimeout.toMillis}ms (${timeoutMinutes.toInt} minutes) for memory limit ${memoryMB} MB")
   }
 }
 
@@ -1185,10 +1200,10 @@ object ContainerProxy {
 
   case class UpdateSodaScore(
     action: FullyQualifiedEntityName,
-    iat: Double,
-    cv: Double,
-    initTime: Long,
-    runTime: Long
+    iat: Double,      // Inter-arrival time from controller (measured at request arrival)
+    cv: Double,       // Coefficient of variation from controller
+    initTime: Long,   // Cold start time (0 for warm starts)
+    runTime: Long     // Execution time
   )
 
   // Needs to be thread-safe as it's used by multiple proxies concurrently.
